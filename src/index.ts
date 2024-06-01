@@ -9,6 +9,7 @@ dotenv.config();
 interface UsageData {
   billDate: string;
   totalUsage: number;
+  billAmount: number;
 }
 
 const getCsvFilePath = (): string => {
@@ -30,11 +31,20 @@ const readCsvData = (filePath: string): Promise<UsageData[]> => {
         results.push({
           billDate: data['Bill Date'],
           totalUsage: parseFloat(data['Total Usage (CCF)']),
+          billAmount: parseFloat(data['Bill Amount'].replace('$', '')),
         });
       })
       .on('end', () => resolve(results))
       .on('error', (error) => reject(error));
   });
+};
+const getPreviousMonthAndYear = (): { month: string; year: string } => {
+  const now = dayjs();
+  const previousMonth = now.subtract(1, 'month');
+  return {
+    month: previousMonth.format('MM'),
+    year: previousMonth.format('YYYY'),
+  };
 };
 
 const getCurrentMonthAndYear = (): { month: string; year: string } => {
@@ -80,7 +90,10 @@ const main = async () => {
     console.log(`Reading CSV data from: ${filePath}`);
     const usageData = await readCsvData(filePath);
 
-    const { month: currentMonth, year: currentYear } = getCurrentMonthAndYear();
+    // TODO: Uncomment the following once I have data for current month
+    // const { month: currentMonth, year: currentYear } = getCurrentMonthAndYear();
+    const { month: currentMonth, year: currentYear } =
+      getPreviousMonthAndYear();
 
     // Get previous years' data for the current month
     const previousYearsData = filterPreviousYearsDataForCurrentMonth(
@@ -104,9 +117,16 @@ const main = async () => {
     }
 
     const currentMonthUsage = currentMonthData.totalUsage;
+    const currentMonthBillAmount = currentMonthData.billAmount;
 
     // Calculate the difference
     const difference = currentMonthUsage - averagePreviousCcf;
+
+    // Calculate the price per CCF for the current month
+    const pricePerCcf = currentMonthBillAmount / currentMonthUsage;
+
+    // Calculate the amount due cost based on the difference
+    const amountDue = difference * pricePerCcf;
 
     console.log(
       `Average CCF for previous years' ${dayjs().format('MMMM')}: ${averagePreviousCcf}`,
@@ -115,10 +135,12 @@ const main = async () => {
       `Total CCF for the current ${dayjs().format('MMMM')}: ${currentMonthUsage}`,
     );
     console.log(`Difference in CCF: ${difference}`);
-
-    // TODO: I now need to do the following
-    // * obtain what each CCF costs
-    // * calculate the cost of the difference
+    console.log(
+      `Price per CCF for the current month: $${pricePerCcf.toFixed(2)}`,
+    );
+    console.log(
+      `Amount cost based on the difference: $${amountDue.toFixed(2)}`,
+    );
   } catch (error) {
     console.error('Error reading CSV data:', error);
   }
