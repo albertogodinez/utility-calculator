@@ -1,5 +1,5 @@
 import * as fs from 'fs';
-import * as path from 'path';
+import { google } from 'googleapis';
 import csv from 'csv-parser';
 import dayjs from 'dayjs';
 import dotenv from 'dotenv';
@@ -12,21 +12,43 @@ interface UsageData {
   billAmount: number;
 }
 
-const getCsvFilePath = (): string => {
-  const csvFilePath = process.env.GAS_DATA_PATH;
-  if (!csvFilePath) {
+const getCredentials = (): any => {
+  const credentialsPath = process.env.GOOGLE_API_CREDENTIALS;
+  if (!credentialsPath) {
     throw new Error(
-      'GAS_DATA_PATH is not defined in the environment variables',
+      'GOOGLE_API_CREDENTIALS is not defined in the environment variables',
     );
   }
-  return path.resolve(process.cwd(), csvFilePath); // Use process.cwd() to resolve the path from the project root
+  return JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
 };
 
-const readCsvData = (filePath: string): Promise<UsageData[]> => {
+const authenticateGoogleDrive = async () => {
+  const credentials = getCredentials();
+  const auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/drive.readonly'],
+  });
+
+  return await auth.getClient();
+};
+
+const fetchFileFromGoogleDrive = async (
+  auth: any,
+  fileId: string,
+): Promise<UsageData[]> => {
+  const drive = google.drive({ version: 'v3', auth });
+
+  const res = await drive.files.get(
+    { fileId, alt: 'media' },
+    { responseType: 'stream' },
+  );
+
   return new Promise((resolve, reject) => {
     const results: UsageData[] = [];
-    fs.createReadStream(filePath)
-      .pipe(csv())
+    const parseStream = csv();
+
+    res.data
+      .pipe(parseStream)
       .on('data', (data) => {
         results.push({
           billDate: data['Bill Date'],
@@ -34,48 +56,79 @@ const readCsvData = (filePath: string): Promise<UsageData[]> => {
           billAmount: parseFloat(data['Bill Amount'].replace('$', '')),
         });
       })
-      .on('end', () => resolve(results))
-      .on('error', (error) => reject(error));
+      .on('end', () => {
+        resolve(results);
+      })
+      .on('error', (error: Error) => {
+        reject(error);
+      });
   });
 };
-const getPreviousMonthAndYear = (): { month: string; year: string } => {
-  const now = dayjs();
-  const previousMonth = now.subtract(1, 'month');
-  return {
-    month: previousMonth.format('MM'),
-    year: previousMonth.format('YYYY'),
-  };
+
+const findClosestDate = (
+  targetDate: dayjs.Dayjs,
+  dates: dayjs.Dayjs[],
+): dayjs.Dayjs | null => {
+  let closestDate: dayjs.Dayjs | null = null;
+  let minDiff = Infinity;
+
+  dates.forEach((date) => {
+    let diff = Math.abs(date.diff(targetDate, 'day'));
+
+    if (targetDate.month() === 1 && targetDate.date() === 29) {
+      // target is February 29
+      const feb28 = date.month() === 1 && date.date() === 28;
+      const mar1 = date.month() === 2 && date.date() === 1;
+      if (feb28 || mar1) {
+        diff = Math.abs(date.diff(targetDate, 'day'));
+      }
+    }
+
+    if (diff < minDiff) {
+      minDiff = diff;
+      closestDate = date;
+    }
+  });
+
+  return closestDate;
 };
 
-const getCurrentMonthAndYear = (): { month: string; year: string } => {
-  const now = dayjs();
-  return { month: now.format('MM'), year: now.format('YYYY') };
-};
-
-const filterPreviousYearsDataForCurrentMonth = (
+const getPreviousYearsClosestDates = (
   data: UsageData[],
-  currentMonth: string,
-  currentYear: string,
+  latestBillDate: dayjs.Dayjs,
 ): UsageData[] => {
-  return data.filter((row) => {
-    const rowMonth = dayjs(row.billDate, 'MM-DD-YYYY').format('MM');
-    const rowYear = dayjs(row.billDate, 'MM-DD-YYYY').format('YYYY');
-    return rowMonth === currentMonth && rowYear !== currentYear;
-  });
-};
+  const latestMonthDay = latestBillDate.format('MM-DD');
 
-const filterCurrentMonthData = (
-  data: UsageData[],
-  currentMonth: string,
-  currentYear: string,
-): UsageData | null => {
-  return (
-    data.find((row) => {
-      const rowMonth = dayjs(row.billDate, 'MM-DD-YYYY').format('MM');
-      const rowYear = dayjs(row.billDate, 'MM-DD-YYYY').format('YYYY');
-      return rowMonth === currentMonth && rowYear === currentYear;
-    }) || null
+  const years = new Set(
+    data
+      .map((row) => dayjs(row.billDate, 'MM-DD-YYYY').year())
+      .filter((year) => year < latestBillDate.year()),
   );
+
+  const closestDates: UsageData[] = [];
+
+  years.forEach((year) => {
+    const datesInYear = data
+      .filter((row) => dayjs(row.billDate, 'MM-DD-YYYY').year() === year)
+      .map((row) => dayjs(row.billDate, 'MM-DD-YYYY'));
+
+    const targetDateInYear = dayjs(`${year}-${latestMonthDay}`, 'YYYY-MM-DD');
+    const closestDate = findClosestDate(targetDateInYear, datesInYear);
+
+    if (closestDate) {
+      console.log(
+        `Using the closest date for year ${year}: ${closestDate.format('MM-DD-YYYY')}`,
+      );
+      const closestRow = data.find((row) =>
+        dayjs(row.billDate, 'MM-DD-YYYY').isSame(closestDate),
+      );
+      if (closestRow) {
+        closestDates.push(closestRow);
+      }
+    }
+  });
+
+  return closestDates;
 };
 
 const getAverageCcf = (data: UsageData[]): number => {
@@ -86,36 +139,43 @@ const getAverageCcf = (data: UsageData[]): number => {
 
 const main = async () => {
   try {
-    const filePath = getCsvFilePath();
-    console.log(`Reading CSV data from: ${filePath}`);
-    const usageData = await readCsvData(filePath);
+    const auth = await authenticateGoogleDrive();
+    const fileId = process.env.GOOGLE_DRIVE_FILE_ID;
+    if (!fileId) {
+      throw new Error(
+        'GOOGLE_DRIVE_FILE_ID is not defined in the environment variables',
+      );
+    }
 
-    // TODO: Uncomment the following once I have data for current month
-    // const { month: currentMonth, year: currentYear } = getCurrentMonthAndYear();
-    const { month: currentMonth, year: currentYear } =
-      getPreviousMonthAndYear();
+    const usageData = await fetchFileFromGoogleDrive(auth, fileId);
+    console.log('Fetched CSV data from Google Drive.');
 
-    // Get previous years' data for the current month
-    const previousYearsData = filterPreviousYearsDataForCurrentMonth(
+    if (usageData.length === 0) {
+      console.log('No data available.');
+      return;
+    }
+    // todo: instead of calling google drive, we should be calling the correct API endpoint per client
+    // i.e MyATXWater, CoaUtilities, etc.
+    // https://www.geeksforgeeks.org/how-to-make-http-requests-in-node-js/
+    // i recommend using approach 4 (HTTP Module) to call
+    // https://austintx.watersmart.com/index.php/direct/to/dest/download_consumption
+    // with the cookies that I will send in an email
+    // !! The previous logic won't really be used, we can start looking at the logic below
+    // Get the latest billing date
+    const latestBillDateStr = usageData[0].billDate;
+    const latestBillDate = dayjs(latestBillDateStr, 'MM-DD-YYYY');
+
+    // Get previous years' closest dates data for the latest billing date
+    const previousYearsData = getPreviousYearsClosestDates(
       usageData,
-      currentMonth,
-      currentYear,
+      latestBillDate,
     );
 
-    // Calculate average CCF for previous years' data for the current month
+    // Calculate average CCF for previous years' data
     const averagePreviousCcf = getAverageCcf(previousYearsData);
 
     // Get current month's data
-    const currentMonthData = filterCurrentMonthData(
-      usageData,
-      currentMonth,
-      currentYear,
-    );
-    if (!currentMonthData) {
-      console.log('No data available for the current month.');
-      return;
-    }
-
+    const currentMonthData = usageData[0];
     const currentMonthUsage = currentMonthData.totalUsage;
     const currentMonthBillAmount = currentMonthData.billAmount;
 
@@ -125,25 +185,46 @@ const main = async () => {
     // Calculate the price per CCF for the current month
     const pricePerCcf = currentMonthBillAmount / currentMonthUsage;
 
-    // Calculate the amount due cost based on the difference
-    const amountDue = difference * pricePerCcf;
+    // Calculate the additional cost based on the difference
+    const additionalCost = difference * pricePerCcf;
 
     console.log(
-      `Average CCF for previous years' ${dayjs().format('MMMM')}: ${averagePreviousCcf}`,
+      `Average CCF for previous years' ${latestBillDate.format('MMMM')}: ${averagePreviousCcf}`,
     );
     console.log(
-      `Total CCF for the current ${dayjs().format('MMMM')}: ${currentMonthUsage}`,
+      `Total CCF for the current ${latestBillDate.format('MMMM')}: ${currentMonthUsage}`,
     );
     console.log(`Difference in CCF: ${difference}`);
     console.log(
       `Price per CCF for the current month: $${pricePerCcf.toFixed(2)}`,
     );
     console.log(
-      `Amount cost based on the difference: $${amountDue.toFixed(2)}`,
+      `Additional cost based on the difference: $${additionalCost.toFixed(2)}`,
     );
   } catch (error) {
-    console.error('Error reading CSV data:', error);
+    console.error('Error fetching CSV data from Google Drive:', error);
   }
 };
 
 main();
+
+/*
+example code for fetching data from an API
+// src/index.ts
+
+async function fetchData() {
+  try {
+    const response = await fetch('https://jsonplaceholder.typicode.com/posts/1');
+    if (!response.ok) {
+      throw new Error(`HTTP error! Status: ${response.status}`);
+    }
+    const data = await response.json();
+    console.log(data);
+  } catch (error) {
+    console.error('Error fetching data:', error);
+  }
+}
+
+fetchData();
+
+*/
