@@ -1,8 +1,15 @@
-import * as fs from 'fs';
+import fs from 'fs';
 import { google } from 'googleapis';
 import csv from 'csv-parser';
 import dayjs from 'dayjs';
 import dotenv from 'dotenv';
+import https, { RequestOptions } from 'https';
+import url from 'url';
+import querystring from 'querystring';
+import {
+  getHeadersWithCookie,
+  getOptionsWithCalculatedContentLength,
+} from './utilities/constants';
 
 dotenv.config();
 
@@ -206,25 +213,237 @@ const main = async () => {
   }
 };
 
-main();
+// main();
 
-/*
-example code for fetching data from an API
-// src/index.ts
+// Function to perform login and get session cookies
+async function loginAndGetSession(
+  email: string,
+  password: string,
+  authSessionCookie: string,
+): Promise<string> {
+  const postData = querystring.stringify({
+    token: '',
+    email: email,
+    password: password,
+  });
+  const options = getOptionsWithCalculatedContentLength(postData);
 
-async function fetchData() {
+  return new Promise<string>((resolve, reject) => {
+    const req = https.request(options, async (res) => {
+      if (!res || !res.statusCode) {
+        reject(new Error('No response from the server.'));
+        return;
+      }
+      if (
+        res.statusCode >= 300 &&
+        res.statusCode < 400 &&
+        res.headers.location
+      ) {
+        const cookies = res.headers['set-cookie'];
+        let phpSessIdCookie = '';
+        if (cookies) {
+          const sessionCookie =
+            cookies.find((cookie) => cookie.startsWith('PHPSESSID')) || '';
+          phpSessIdCookie = sessionCookie.split(';')[0].split('=')[1] || '';
+        }
+
+        const cookiesString = phpSessIdCookie
+          ? `auth_session=${authSessionCookie}; PHPSESSID=${phpSessIdCookie}`
+          : `auth_session=${authSessionCookie}`;
+
+        // Handle initial redirect
+        const redirectUrl = url.resolve(
+          `https://${options.hostname}${options.path}`,
+          res.headers.location,
+        );
+        console.log(`First redirect is to ${redirectUrl}`);
+
+        const updatedPhpSessIdCookie = await handleRedirects(
+          redirectUrl,
+          cookiesString,
+          authSessionCookie,
+        );
+
+        phpSessIdCookie = updatedPhpSessIdCookie
+          ? updatedPhpSessIdCookie
+          : phpSessIdCookie;
+
+        if (phpSessIdCookie) {
+          resolve(phpSessIdCookie);
+        } else {
+          reject(new Error('No PHPSESSID cookie found in the response'));
+        }
+      } else {
+        reject(new Error(`Unexpected status code: ${res.statusCode}`));
+      }
+    });
+
+    req.on('error', (e) => {
+      reject(new Error(`Problem with login request: ${e.message}`));
+    });
+
+    req.write(postData);
+    req.end();
+  });
+}
+
+async function handleRedirects(
+  initialUrl: string,
+  cookie: string,
+  authSessionCookie: string,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const options: RequestOptions = {
+      headers: {
+        Accept:
+          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
+        'Accept-Language': 'en-US,en;q=0.9',
+        DNT: '1',
+        Referer: 'https://austintx.watersmart.com/index.php/logout',
+        'Sec-CH-UA': '"Chromium";v="127", "Not)A;Brand";v="99"',
+        'Sec-CH-UA-Mobile': '?0',
+        'Sec-CH-UA-Platform': '"macOS"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+        Cookie: cookie,
+      },
+    };
+    let updatedPhpSessIdCookie = '';
+
+    const recursiveRequest = (currentUrl: string, options: RequestOptions) => {
+      https
+        .get(currentUrl, options, (res) => {
+          if (
+            res.statusCode &&
+            res.statusCode >= 300 &&
+            res.statusCode < 400 &&
+            res.headers.location
+          ) {
+            const cookies = res.headers['set-cookie'];
+            let phpSessIdCookie = '';
+            if (cookies) {
+              const sessionCookie =
+                cookies.find((cookie) => cookie.startsWith('PHPSESSID')) || '';
+              phpSessIdCookie = sessionCookie.split(';')[0].split('=')[1] || '';
+              console.log(`phpSessIdCookie cookie: ${phpSessIdCookie}`);
+              if (options.headers && phpSessIdCookie) {
+                options.headers.Cookie = `auth_session=${authSessionCookie}; PHPSESSID=${phpSessIdCookie}`;
+                console.log('updated options:', options);
+                updatedPhpSessIdCookie = phpSessIdCookie;
+              }
+            }
+            // Follow the redirect
+            const nextUrl = url.resolve(currentUrl, res.headers.location);
+            console.log(`Redirecting to ${nextUrl}`);
+
+            recursiveRequest(nextUrl, options);
+          } else if (res.statusCode === 200) {
+            // Successfully reached the final destination
+            console.log('Final destination reached.');
+            console.log(res.url);
+            resolve(updatedPhpSessIdCookie);
+          } else {
+            reject(new Error(`Unexpected status code: ${res.statusCode}`));
+          }
+        })
+        .on('error', (e) => {
+          reject(new Error(`Problem with request: ${e.message}`));
+        });
+    };
+
+    recursiveRequest(initialUrl, options);
+  });
+}
+
+// Function to fetch the file using the session cookie
+async function fetchFile(
+  fileUrl: string,
+  outputFile: string,
+  sessionCookie: string,
+): Promise<void> {
+  const options = getHeadersWithCookie(sessionCookie);
+
+  return new Promise<void>((resolve, reject) => {
+    const request = https.get(fileUrl, options, async (response) => {
+      if (!response || !response.statusCode) {
+        throw new Error('No response from the server.');
+      }
+      if (
+        response.statusCode >= 300 &&
+        response.statusCode < 400 &&
+        response.headers.location
+      ) {
+        // Handle redirect
+        const redirectUrl = url.resolve(fileUrl, response.headers.location);
+        console.log(`Redirecting to ${redirectUrl}`);
+        await fetchFile(redirectUrl, outputFile, sessionCookie);
+        resolve();
+      } else if (response.statusCode === 200) {
+        const fileStream = fs.createWriteStream(outputFile);
+
+        response.pipe(fileStream);
+
+        fileStream.on('finish', () => {
+          fileStream.close();
+          console.log('Download completed.');
+          resolve();
+        });
+      } else {
+        reject(
+          new Error(
+            `Failed to fetch file. Status code: ${response.statusCode}`,
+          ),
+        );
+      }
+    });
+
+    request.on('error', (err) => {
+      reject(new Error(`Request error: ${err.message}`));
+    });
+  });
+}
+
+// Usage
+async function waterUtilitiesInit() {
   try {
-    const response = await fetch('https://jsonplaceholder.typicode.com/posts/1');
-    if (!response.ok) {
-      throw new Error(`HTTP error! Status: ${response.status}`);
+    const email = process.env.WATER_UTILITY_EMAIL as string;
+    const password = process.env.WATER_UTILITY_PASSWORD as string;
+    const fileUrl = process.env.WATER_UTILITY_DOWNLOAD_URL as string;
+    const authSessionCookie = process.env
+      .WATER_UTILITY_AUTH_SESSION_COOKIE as string;
+
+    if (!email || !password || !fileUrl || !authSessionCookie) {
+      throw new Error(
+        'One or more of the required environment variables are missing.',
+      );
     }
-    const data = await response.json();
-    console.log(data);
+
+    const outputFile = 'download.csv';
+
+    const phpSessIdCookie = await loginAndGetSession(
+      email,
+      password,
+      authSessionCookie,
+    );
+    console.log('phpSessIdCookie cookie:', phpSessIdCookie);
+
+    if (!phpSessIdCookie) {
+      throw new Error('Failed to get PHPSESSID cookie.');
+    }
+
+    const combinedCookie = `auth_session=${authSessionCookie}; PHPSESSID=${phpSessIdCookie}`;
+    console.log('Combined cookie:', combinedCookie);
+
+    await fetchFile(fileUrl, outputFile, combinedCookie);
   } catch (error) {
-    console.error('Error fetching data:', error);
+    console.error(error);
   }
 }
 
-fetchData();
-
-*/
+waterUtilitiesInit();
