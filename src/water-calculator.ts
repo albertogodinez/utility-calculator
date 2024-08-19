@@ -25,7 +25,7 @@ class WaterCalculator {
     });
     const options = getOptionsWithCalculatedContentLength(postData);
 
-    return new Promise<string>((resolve, reject) => {
+    const phpSessIdCookie = await new Promise<string>((resolve, reject) => {
       const req = https.request(options, async (res) => {
         if (!res || !res.statusCode) {
           reject(new Error('No response from the server.'));
@@ -48,7 +48,6 @@ class WaterCalculator {
             ? `auth_session=${authSessionCookie}; PHPSESSID=${phpSessIdCookie}`
             : `auth_session=${authSessionCookie}`;
 
-          // Handle initial redirect
           const redirectUrl = url.resolve(
             `https://${options.hostname}${options.path}`,
             res.headers.location,
@@ -65,11 +64,11 @@ class WaterCalculator {
             ? updatedPhpSessIdCookie
             : phpSessIdCookie;
 
-          if (phpSessIdCookie) {
-            resolve(phpSessIdCookie);
-          } else {
-            reject(new Error('No PHPSESSID cookie found in the response'));
+          if (!phpSessIdCookie) {
+            reject(new Error('Failed to get PHPSESSID cookie.'));
           }
+
+          resolve(phpSessIdCookie);
         } else {
           reject(new Error(`Unexpected status code: ${res.statusCode}`));
         }
@@ -82,6 +81,8 @@ class WaterCalculator {
       req.write(postData);
       req.end();
     });
+
+    return phpSessIdCookie;
   }
 
   async handleRedirects(
@@ -119,6 +120,7 @@ class WaterCalculator {
                   updatedPhpSessIdCookie = phpSessIdCookie;
                 }
               }
+
               // Follow the redirect
               const nextUrl = url.resolve(currentUrl, res.headers.location);
               console.log(`Redirecting to ${nextUrl}`);
@@ -147,10 +149,10 @@ class WaterCalculator {
     fileUrl: string,
     outputFile: string,
     sessionCookie: string,
-  ): Promise<void> {
+  ): Promise<string> {
     const options = getHeadersWithCookie(sessionCookie);
 
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<string>((resolve, reject) => {
       const request = https.get(fileUrl, options, async (response) => {
         if (!response || !response.statusCode) {
           throw new Error('No response from the server.');
@@ -163,15 +165,27 @@ class WaterCalculator {
           // Handle redirect
           const redirectUrl = url.resolve(fileUrl, response.headers.location);
           console.log(`Redirecting to ${redirectUrl}`);
-          await this.fetchFile(redirectUrl, outputFile, sessionCookie);
-          resolve();
+          const fetchFileResponse = await this.fetchFile(
+            redirectUrl,
+            outputFile,
+            sessionCookie,
+          );
+          resolve(fetchFileResponse);
         } else if (response.statusCode === 200) {
           const fileStream = fs.createWriteStream(outputFile);
+          let csvData = '';
+
+          response.on('data', (chunk) => {
+            csvData += chunk;
+          });
 
           response.pipe(fileStream).on('finish', () => {
             fileStream.close();
             console.log('Download completed.');
-            resolve();
+          });
+
+          response.on('end', () => {
+            resolve(csvData);
           });
         } else {
           reject(
@@ -213,7 +227,13 @@ class WaterCalculator {
 
       const combinedCookie = `auth_session=${authSessionCookie}; PHPSESSID=${phpSessIdCookie}`;
 
-      await this.fetchFile(fileUrl, this.outputFile, combinedCookie);
+      const csv = await this.fetchFile(
+        fileUrl,
+        this.outputFile,
+        combinedCookie,
+      );
+      console.log('CSV data:', csv);
+      // TODO: Start from here with the csv and add it into it's own array of objects
     } catch (error) {
       console.error(error);
     }
