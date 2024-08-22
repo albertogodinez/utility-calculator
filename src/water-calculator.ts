@@ -234,6 +234,41 @@ class WaterCalculator {
       );
       console.log('CSV data:', csv);
       // TODO: Start from here with the csv and add it into it's own array of objects
+      //using Account Number, Reading Date, Gallons, and Meter 
+  function parseCSV(csvData: string): Array<{ [key: string]: string }> {
+  const lines = csvData.split('\n'); // Split by new line to get each row
+  const headers = lines[0].split(','); // First line contains headers
+  const data = [];
+
+  // Loop through each subsequent row
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(','); // Split the row by commas
+    if (values.length === headers.length) { // Ensure correct number of columns
+      const obj: { [key: string]: string } = {};
+      // Create an object where keys are headers and values are row values
+      headers.forEach((header, index) => {
+        obj[header.trim()] = values[index].trim(); // Trim to remove extra spaces
+      });
+      data.push(obj); // Push object into data array
+    }
+  }
+
+  return data;
+}
+
+// Parse the CSV data into an array of objects
+const parsedData = parseCSV(csv);
+
+// Filter and map the data to extract only the relevant fields: Account Number, Reading Date, Gallons, and Meter
+const processedData = parsedData.map((entry) => ({
+  AccountNumber: entry['Account Number'],
+  ReadingDate: entry['Reading Date'],
+  gallons: entry['Gallons'],
+  Meter: entry['Meter'],
+}));
+
+console.log('Processed Data:', processedData);
+      //!! stop
     } catch (error) {
       console.error(error);
     }
